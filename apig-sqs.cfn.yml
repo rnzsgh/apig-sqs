@@ -1,0 +1,263 @@
+---
+
+# Any code, applications, scripts, templates, proofs of concept,
+# documentation and other items are provided for illustration purposes only.
+
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Parameters:
+
+  BillingCode:
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+
+  CertificateArn:
+    Type: String
+    Description: The SSL/TLS certificate ARN
+    MinLength: 0
+    MaxLength: 2048
+    Default: ""
+
+  VisibilityTimeout:
+    Type: Number
+    Description: The SQS visibility timeout
+    MinValue: 0
+    MaxValue: 43200
+    Default: 60
+
+  DomainName:
+    Type: String
+    Description: Domain name for the API Gateway
+    Default: ""
+    AllowedPattern: "(^$|^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,6}$)" # Allow for a blank or a domain name
+    ConstraintDescription: Please enter a valid domain name
+
+  HostedZoneName:
+    Type: String
+    Description: The Amazon Route 53 Hosted Zone Name for the optional load balancer alias record - do not include a period at the end
+    Default: ""
+    AllowedPattern: "(^$|^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,6}$)" # Allow for a blank or a domain name
+    ConstraintDescription: Please enter a valid Route 53 Hosted Zone Name
+
+
+Conditions:
+
+  IsCustomHostnameTlsEnabled: !And
+    - !Not [ !Equals [ !Ref CertificateArn, "" ] ]
+    - !Not [ !Equals [ !Ref DomainName, "" ] ]
+    - !Not [ !Equals [ !Ref HostedZoneName, "" ] ]
+
+
+Resources:
+
+  SqsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !Ref VisibilityTimeout
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: Cost
+          Value: !Ref BillingCode
+
+  SqsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Id: !Ref SqsQueue
+        Statement:
+          - Sid: sqs-anonymous-send-message
+            Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt SqsQueue.Arn
+      Queues:
+        - !Ref SqsQueue
+
+  SqsApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /sqs/${AWS::StackName}/apig
+
+  SqsApiAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  SqsApiAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt SqsApiAccountRole.Arn
+
+  SqsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      EndpointConfiguration:
+        Types:
+          - EDGE
+    DependsOn: SqsApiAccount
+
+  SqsApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      CertificateArn: !Ref CertificateArn
+      DomainName: !Ref DomainName
+      EndpointConfiguration:
+        Types:
+          - EDGE
+
+  Route53Record:
+    Type: AWS::Route53::RecordSet
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}.
+      Name: !Sub ${DomainName}.
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SqsApiDomainName.DistributionDomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  SqsApiMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      DomainName: !Ref DomainName
+      RestApiId: !Ref SqsApi
+
+  SqsApiCertificate:
+    Type: AWS::ApiGateway::ClientCertificate
+
+  SqsApiSendMessageServiceProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      PathPart: s
+      RestApiId: !Ref SqsApi
+      ParentId:
+        !GetAtt SqsApi.RootResourceId
+    DependsOn:
+      - SqsApi
+
+  SqsApiGatewayProxySendMessageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: api-gateway-sqs-send-message
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt SqsQueue.Arn
+
+  SqsApiIngestServiceProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SqsApi
+      ResourceId: !Ref SqsApiSendMessageServiceProxyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Credentials: !GetAtt SqsApiGatewayProxySendMessageRole.Arn
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:action/SendMessage
+        RequestParameters:
+          integration.request.querystring.QueueUrl: !Sub "'${SqsQueue}'"
+          integration.request.querystring.MessageBody: "method.request.body"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+    DependsOn:
+      - SqsApi
+      - SqsApiSendMessageServiceProxyResource
+      - SqsApiGatewayProxySendMessageRole
+
+  SqsApiProdDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref SqsApi
+      StageName: p
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !GetAtt SqsApiGatewayLogGroup.Arn
+        MetricsEnabled: true
+        LoggingLevel: ERROR
+    DependsOn:
+      - SqsApi
+      - SqsApiIngestServiceProxyMethod
+
+
+Outputs:
+
+  SqsQueueUrl:
+    Value: !Ref SqsQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-queue-url
+
+  SqsQueueArn:
+    Value: !GetAtt SqsQueue.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-queue-arn
+
+  SqsQueueName:
+    Value: !GetAtt SqsQueue.QueueName
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-queue-name
+
+  SqsApiId:
+    Value: !Ref SqsApi
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-api-gateway-id
+
+  SqsApiRootResourceId:
+    Value: !GetAtt SqsApi.RootResourceId
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-api-gateway-root-resource-id
+
+  SqsApiCertificateName:
+    Value: !Ref SqsApiCertificate
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-api-gateway-client-cert-name
+
+  SqsApiProdDeploymentId:
+    Value: !Ref SqsApiProdDeployment
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-api-gateway-prod-deployment-id
+
+  SqsApiGatewayProxySendMessageRoleArn:
+    Value: !GetAtt SqsApiGatewayProxySendMessageRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-sqs-api-gateway-proxy-send-message-role-arn
